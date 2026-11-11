@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .metadata import META_PROPERTIES, META_REQUIRED, SHORTS_GUIDE, ShortsMeta, meta_from_dict
 from .subtitles import Cue, format_timestamp
 
 DEFAULT_MODEL = os.environ.get("CLIPSMITH_MODEL", "claude-sonnet-4-5")
@@ -16,6 +17,11 @@ You receive a movie transcript as numbered subtitle cues with timestamps.
 Pick self-contained moments that work without extra context: a strong opening line,
 a clear payoff (a joke, a reveal, an emotional beat, a memorable quote), and a clean ending.
 Never start or end a clip in the middle of an exchange. Prefer moments that do not overlap.
+Every clip will be published as a YouTube Shorts video, so for each one also write its
+title, alternative titles, description and hashtags.
+
+""" + SHORTS_GUIDE + """
+
 Always answer by calling the `submit_clips` tool."""
 
 CLIPS_TOOL: dict[str, Any] = {
@@ -51,8 +57,10 @@ CLIPS_TOOL: dict[str, Any] = {
                             "maximum": 10,
                             "description": "How strong the clip is.",
                         },
+                        **META_PROPERTIES,
                     },
-                    "required": ["title", "start_cue", "end_cue", "reason", "score"],
+                    "required": ["title", "start_cue", "end_cue", "reason", "score"]
+                    + META_REQUIRED,
                 },
             }
         },
@@ -70,10 +78,25 @@ class Clip:
     end_cue: int
     reason: str = ""
     score: int = 0
+    # YouTube Shorts metadata; kept flat so the plan JSON is easy to edit by hand.
+    shorts_title: str = ""
+    alt_titles: list[str] = field(default_factory=list)
+    description: str = ""
+    hashtags: list[str] = field(default_factory=list)
 
     @property
     def duration(self) -> float:
         return self.end - self.start
+
+    def meta(self) -> ShortsMeta:
+        return ShortsMeta(self.shorts_title, list(self.alt_titles), self.description,
+                          list(self.hashtags))
+
+    def set_meta(self, meta: ShortsMeta) -> None:
+        self.shorts_title = meta.title
+        self.alt_titles = list(meta.alt_titles)
+        self.description = meta.description
+        self.hashtags = list(meta.hashtags)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -101,6 +124,7 @@ def build_request(
     theme: str | None,
     language: str | None,
     model: str,
+    movie: str | None = None,
 ) -> dict[str, Any]:
     task = [
         f"Select up to {count} clips.",
@@ -109,14 +133,17 @@ def build_request(
     ]
     if theme:
         task.append(f"Focus on this theme / request from the user: {theme}")
+    task.append(
+        f"Movie / series: {movie}." if movie else "The movie name is unknown - do not guess it."
+    )
     if language:
-        task.append(f"Write titles and reasons in {language}.")
+        task.append(f"Write all texts in {language}.")
     else:
-        task.append("Write titles and reasons in the language of the transcript.")
+        task.append("Write all texts in the language of the transcript.")
 
     return {
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "system": SYSTEM_PROMPT,
         "tools": [CLIPS_TOOL],
         "tool_choice": {"type": "tool", "name": "submit_clips"},
@@ -160,17 +187,17 @@ def clips_from_response(
         # Allow some slack: the model is told the limits but can't measure precisely.
         if end - start > max_duration * 1.5:
             continue
-        clips.append(
-            Clip(
-                title=str(item.get("title", "")).strip() or f"Clip {len(clips) + 1}",
-                start=start,
-                end=end,
-                start_cue=a,
-                end_cue=b,
-                reason=str(item.get("reason", "")).strip(),
-                score=int(item.get("score", 0) or 0),
-            )
+        clip = Clip(
+            title=str(item.get("title", "")).strip() or f"Clip {len(clips) + 1}",
+            start=start,
+            end=end,
+            start_cue=a,
+            end_cue=b,
+            reason=str(item.get("reason", "")).strip(),
+            score=int(item.get("score", 0) or 0),
         )
+        clip.set_meta(meta_from_dict(item))
+        clips.append(clip)
     clips.sort(key=lambda c: c.score, reverse=True)
     return clips
 
@@ -183,6 +210,7 @@ def suggest_clips(
     max_duration: float = 90,
     theme: str | None = None,
     language: str | None = None,
+    movie: str | None = None,
     model: str = DEFAULT_MODEL,
     client: Any = None,
 ) -> list[Clip]:
@@ -201,6 +229,7 @@ def suggest_clips(
         theme=theme,
         language=language,
         model=model,
+        movie=movie,
     )
     response = client.messages.create(**request)
     for block in response.content:

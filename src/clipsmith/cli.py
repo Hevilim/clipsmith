@@ -4,15 +4,35 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, subtitles, video
+from . import __version__, metadata, subtitles, video
 from .analyze import DEFAULT_MODEL, Clip, suggest_clips
 from .subtitles import Cue, format_timestamp
 
 SUB_EXTENSIONS = (".srt", ".vtt")
+CONTEXT_SECONDS = 90  # transcript before a clip that Claude sees when writing its metadata
+
+
+def load_dotenv(path: Path = Path(".env")) -> None:
+    """Minimal .env support: KEY=value lines; real environment variables win."""
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.removeprefix("export ").split("=", 1)
+        key, value = key.strip(), value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def has_api_key() -> bool:
+    return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
 
 
 def parse_time(value: str) -> float:
@@ -71,6 +91,8 @@ def print_clips(clips: list[Clip]) -> None:
             f"    {short_ts(clip.start)} → {short_ts(clip.end)}  ({clip.duration:.0f}s)\n"
             f"    {clip.reason}"
         )
+        if clip.shorts_title:
+            print(f"    Shorts: {clip.shorts_title}")
 
 
 def save_plan(path: Path, video_path: Path, clips: list[Clip]) -> None:
@@ -96,6 +118,36 @@ def parse_selection(value: str | None, total: int) -> list[int]:
     return picked
 
 
+def cues_between(cues: list[Cue], start: float, end: float) -> list[Cue]:
+    return [c for c in cues if c.end > start and c.start < end]
+
+
+def ensure_meta(args: argparse.Namespace, cues: list[Cue], clip: Clip) -> metadata.ShortsMeta | None:
+    """Return the clip's Shorts metadata, asking Claude for it if the clip has none yet."""
+    if clip.shorts_title:
+        return clip.meta()
+    if args.no_meta:
+        return None
+    clip_cues = cues_between(cues, clip.start, clip.end)
+    if not clip_cues:
+        print("    (no subtitles in the clip — skipping title/description)", file=sys.stderr)
+        return None
+    if not has_api_key():
+        print("    (ANTHROPIC_API_KEY not set — skipping title/description)", file=sys.stderr)
+        return None
+    print(f"    Writing title/description with {args.model}…", file=sys.stderr)
+    meta = metadata.describe_clip(
+        clip_cues,
+        context_cues=cues_between(cues, clip.start - CONTEXT_SECONDS, clip.start),
+        movie=args.movie,
+        language=args.language,
+        hint=getattr(args, "hint", None),
+        model=args.model,
+    )
+    clip.set_meta(meta)
+    return meta
+
+
 def render_all(args: argparse.Namespace, cues: list[Cue], clips: list[Clip]) -> None:
     video.ensure_ffmpeg()
     duration = video.probe_duration(args.video)
@@ -116,6 +168,10 @@ def render_all(args: argparse.Namespace, cues: list[Cue], clips: list[Clip]) -> 
             layout=args.layout,
             video_duration=duration,
         )
+        meta = ensure_meta(args, cues, clip)
+        if meta:
+            txt = metadata.write_meta(meta, target)
+            print(f"    Shorts: {meta.title}\n    → {txt}", file=sys.stderr)
     print(f"Done: {len(clips)} clip(s) in {out_dir}", file=sys.stderr)
 
 
@@ -150,7 +206,24 @@ def cmd_cut(args: argparse.Namespace) -> None:
     if args.end <= args.start:
         raise SystemExit("--end must be after --start")
     clip = Clip(title=args.title, start=args.start, end=args.end, start_cue=0, end_cue=0)
+    if args.hint is None and args.title != "clip":
+        args.hint = args.title
     render_all(args, cues, [clip])
+
+
+def cmd_describe(args: argparse.Namespace) -> None:
+    """Write Shorts metadata for an already rendered clip, from the .srt next to it."""
+    for clip_path in args.clips:
+        srt = args.subs or clip_path.with_suffix(".srt")
+        if not srt.exists():
+            raise SystemExit(f"No subtitles for {clip_path.name}: expected {srt}")
+        print(f"{clip_path.name}: asking {args.model}…", file=sys.stderr)
+        meta = metadata.describe_clip(
+            subtitles.load(srt), movie=args.movie, language=args.language, hint=args.hint,
+            model=args.model,
+        )
+        txt = metadata.write_meta(meta, clip_path)
+        print(f"\n=== {clip_path.name} → {txt}\n\n{meta.to_text()}")
 
 
 def cmd_transcribe(args: argparse.Namespace) -> None:
@@ -196,6 +269,7 @@ def _suggest(args: argparse.Namespace, cues: list[Cue]) -> list[Clip]:
         max_duration=args.max_duration,
         theme=args.theme,
         language=args.language,
+        movie=args.movie,
         model=args.model,
     )
 
@@ -221,13 +295,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--subs-stream", type=int, default=0, help="Embedded subtitle track index (default: 0)"
     )
 
+    claude = argparse.ArgumentParser(add_help=False)
+    claude.add_argument(
+        "--model", default=DEFAULT_MODEL, help=f"Claude model (default: {DEFAULT_MODEL})"
+    )
+    claude.add_argument("--language", help="Language for titles/descriptions (default: transcript's)")
+    claude.add_argument(
+        "--movie", help='Movie/series name for titles and hashtags, e.g. "Слово пацана"'
+    )
+
     ai = argparse.ArgumentParser(add_help=False)
     ai.add_argument("-n", "--count", type=int, default=5, help="How many clips (default: 5)")
     ai.add_argument("--min-duration", type=float, default=20, help="Seconds (default: 20)")
     ai.add_argument("--max-duration", type=float, default=90, help="Seconds (default: 90)")
     ai.add_argument("--theme", help='What to look for, e.g. "funniest jokes" or "plot twists"')
-    ai.add_argument("--language", help="Language for titles/reasons (default: transcript's)")
-    ai.add_argument("--model", default=DEFAULT_MODEL, help=f"Claude model (default: {DEFAULT_MODEL})")
 
     render = argparse.ArgumentParser(add_help=False)
     render.add_argument("-o", "--out", type=Path, default=Path("clips"), help="Output directory")
@@ -244,24 +325,50 @@ def build_parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--padding", type=float, default=0.5, help="Extra seconds before/after (default: 0.5)"
     )
+    render.add_argument(
+        "--no-meta", action="store_true",
+        help="Don't write a YouTube title/description (.txt next to each clip)",
+    )
 
-    p = sub.add_parser("suggest", parents=[common, ai], help="Ask Claude for clips, save a plan")
+    p = sub.add_parser(
+        "suggest", parents=[common, claude, ai], help="Ask Claude for clips, save a plan"
+    )
     p.add_argument("--plan", type=Path, help="Where to save the plan (default: <video>.plan.json)")
     p.set_defaults(func=cmd_suggest)
 
-    p = sub.add_parser("render", parents=[common, render], help="Render clips from a plan file")
+    p = sub.add_parser(
+        "render", parents=[common, claude, render], help="Render clips from a plan file"
+    )
     p.add_argument("--plan", type=Path, required=True, help="Plan JSON from `suggest`")
     p.add_argument("--only", help="Comma-separated clip numbers to render, e.g. 1,3")
     p.set_defaults(func=cmd_render)
 
-    p = sub.add_parser("run", parents=[common, ai, render], help="Suggest and render in one go")
+    p = sub.add_parser(
+        "run", parents=[common, claude, ai, render], help="Suggest and render in one go"
+    )
     p.set_defaults(func=cmd_run)
 
-    p = sub.add_parser("cut", parents=[common, render], help="Cut a clip manually, no AI")
+    p = sub.add_parser(
+        "cut", parents=[common, claude, render],
+        help="Cut a clip at given times (Claude only writes the title/description)",
+    )
     p.add_argument("--start", type=parse_time, required=True, help="e.g. 01:02:03.5")
     p.add_argument("--end", type=parse_time, required=True, help="e.g. 01:03:10")
-    p.add_argument("--title", default="clip", help="Used for the file name")
+    p.add_argument(
+        "--title", default="clip",
+        help="Working title: used for the file name and as --hint if none is given",
+    )
+    p.add_argument("--hint", help='What happens on screen, e.g. "бомж избивает бандита"')
     p.set_defaults(func=cmd_cut)
+
+    p = sub.add_parser(
+        "describe", parents=[claude],
+        help="Write a YouTube Shorts title/description for rendered clips (uses their .srt)",
+    )
+    p.add_argument("clips", type=Path, nargs="+", help="Rendered clip(s), e.g. clips/*.mp4")
+    p.add_argument("--subs", type=Path, help="Subtitles of the clip (default: <clip>.srt)")
+    p.add_argument("--hint", help='What happens on screen, e.g. "бомж избивает бандита"')
+    p.set_defaults(func=cmd_describe)
 
     from .transcribe import DEFAULT_MODEL as WHISPER_MODEL
 
@@ -287,6 +394,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
+    load_dotenv()
     args = build_parser().parse_args(argv)
     try:
         args.func(args)

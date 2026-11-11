@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from clipsmith.analyze import build_request, clips_from_response, suggest_clips
+from clipsmith.analyze import Clip, build_request, clips_from_response, suggest_clips
 from clipsmith.subtitles import Cue
 
 CUES = [Cue(i, i * 10.0, i * 10.0 + 5, f"line {i}") for i in range(1, 21)]
@@ -42,6 +42,28 @@ def test_clips_from_response_validates_and_sorts():
     assert [c.title for c in clips] == ["B", "A"]
     assert (clips[0].start, clips[0].end) == (60.0, 85.0)
     assert (clips[1].start_cue, clips[1].end_cue) == (2, 4)
+
+
+def test_clips_carry_shorts_metadata_through_plan_json():
+    raw = [{
+        "title": "A", "start_cue": 1, "end_cue": 3, "reason": "r", "score": 8,
+        "shorts_title": "Он не ожидал такого ответа", "alt_titles": ["Кто ты?"],
+        "description": "А ты бы что сделал?", "hashtags": ["кино"],
+    }]
+    clip = clips_from_response(raw, CUES, max_duration=60)[0]
+    assert clip.shorts_title == "Он не ожидал такого ответа"
+    assert clip.hashtags == ["#shorts", "#кино"]
+    again = Clip.from_dict(clip.to_dict())
+    assert again.meta() == clip.meta()
+
+
+def test_clips_tool_requires_metadata():
+    req = build_request(
+        CUES, count=1, min_duration=10, max_duration=60, theme=None, language=None, model="m"
+    )
+    item = req["tools"][0]["input_schema"]["properties"]["clips"]["items"]
+    assert {"shorts_title", "description", "hashtags"} <= set(item["required"])
+    assert "#shorts" in req["system"]
 
 
 def test_suggest_clips_with_fake_client():
