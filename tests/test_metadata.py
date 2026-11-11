@@ -71,7 +71,7 @@ def test_request_uses_clip_relative_times_and_context():
     assert "00:00 Кто ты?" in text and "00:03 Бомж. / Никто." in text
     assert "<context>" in text and "Раньше" in text
     assert "Movie / series: Сериал." in text
-    assert req["tool_choice"]["name"] == "submit_metadata"
+    assert req["tools"][0]["name"] == "submit_metadata"
 
 
 def test_request_includes_on_screen_hint():

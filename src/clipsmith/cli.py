@@ -9,8 +9,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import __version__, metadata, subtitles, video
-from .analyze import DEFAULT_MODEL, Clip, suggest_clips
+from . import __version__, metadata, music, subtitles, video
+from .analyze import DEFAULT_MAX_MUSIC, DEFAULT_MODEL, Clip, suggest_clips
 from .subtitles import Cue, format_timestamp
 
 SUB_EXTENSIONS = (".srt", ".vtt")
@@ -91,6 +91,8 @@ def print_clips(clips: list[Clip]) -> None:
             f"    {short_ts(clip.start)} → {short_ts(clip.end)}  ({clip.duration:.0f}s)\n"
             f"    {clip.reason}"
         )
+        if clip.music:
+            print(f"    ♪ original music in {clip.music:.0%} of the clip")
         if clip.shorts_title:
             print(f"    Shorts: {clip.shorts_title}")
 
@@ -148,15 +150,51 @@ def ensure_meta(args: argparse.Namespace, cues: list[Cue], clip: Clip) -> metada
     return meta
 
 
+def progress_printer(label: str):
+    def progress(done: float, total: float) -> None:
+        pct = 100 * done / total if total else 0
+        print(f"\r  {label} {short_ts(done)} / {short_ts(total)}  ({pct:.0f}%)", end="",
+              file=sys.stderr)
+    return progress
+
+
+def get_music_map(args: argparse.Namespace) -> music.MusicMap:
+    result = music.load_or_scan(
+        args.video,
+        audio_stream=args.audio_stream,
+        on_progress=progress_printer("music scan"),
+        log=lambda msg: print(msg, file=sys.stderr),
+    )
+    print(file=sys.stderr)
+    return result
+
+
+def warn_original_music(args: argparse.Namespace, clips: list[Clip]) -> None:
+    """For manual cuts: say if the clip has original music, using a cached scan only."""
+    if not music.map_path(args.video).exists():
+        return
+    music_map = music.MusicMap.load(music.map_path(args.video))
+    for clip in clips:
+        share = music_map.fraction(clip.start, clip.end)
+        if share > DEFAULT_MAX_MUSIC:
+            print(f"  ♪ warning: original music in {share:.0%} of «{clip.title}»",
+                  file=sys.stderr)
+
+
 def render_all(args: argparse.Namespace, cues: list[Cue], clips: list[Clip]) -> None:
     video.ensure_ffmpeg()
     duration = video.probe_duration(args.video)
     out_dir: Path = args.out
     subs_mode = args.subs_mode if cues else "none"
+    tracks = music.list_tracks(args.music) if args.music else []
     for n, clip in enumerate(clips, start=1):
         name = f"{n:02d}-{video.slugify(clip.title)}.mp4"
         target = out_dir / name
+        # A folder of tracks is used round-robin, so a batch of clips doesn't all sound alike.
+        track = tracks[(n - 1) % len(tracks)] if tracks else None
         print(f"[{n}/{len(clips)}] {clip.title} → {target}", file=sys.stderr)
+        if track:
+            print(f"    music: {track.name}", file=sys.stderr)
         video.render_clip(
             args.video,
             cues,
@@ -167,8 +205,15 @@ def render_all(args: argparse.Namespace, cues: list[Cue], clips: list[Clip]) -> 
             subs=subs_mode,
             layout=args.layout,
             video_duration=duration,
+            music=track,
+            music_level=args.music_level,
         )
         meta = ensure_meta(args, cues, clip)
+        credit = music.track_credit(track) if track else ""
+        if meta and credit:
+            meta = metadata.ShortsMeta(
+                meta.title, meta.alt_titles, f"{meta.description}\n\n{credit}", meta.hashtags
+            )
         if meta:
             txt = metadata.write_meta(meta, target)
             print(f"    Shorts: {meta.title}\n    → {txt}", file=sys.stderr)
@@ -190,6 +235,7 @@ def cmd_render(args: argparse.Namespace) -> None:
     cues = load_cues(args.video, args.subs, args.subs_stream, required=False)
     clips = load_plan(args.plan)
     clips = [clips[i] for i in parse_selection(args.only, len(clips))]
+    warn_original_music(args, clips)
     render_all(args, cues, clips)
 
 
@@ -199,6 +245,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     print_clips(clips)
     if clips:
         render_all(args, cues, clips)
+        # Saved after rendering, so it includes metadata written along the way.
+        save_plan(args.out / "plan.json", args.video, clips)
 
 
 def cmd_cut(args: argparse.Namespace) -> None:
@@ -208,7 +256,22 @@ def cmd_cut(args: argparse.Namespace) -> None:
     clip = Clip(title=args.title, start=args.start, end=args.end, start_cue=0, end_cue=0)
     if args.hint is None and args.title != "clip":
         args.hint = args.title
+    warn_original_music(args, [clip])
     render_all(args, cues, [clip])
+
+
+def cmd_scan_music(args: argparse.Namespace) -> None:
+    music_map = get_music_map(args)
+    segments = music_map.segments()
+    total = len(music_map.scores) * music_map.hop
+    in_music = sum(b - a for a, b in segments)
+    print(f"Original music: {in_music / total:.0%} of {short_ts(total)}")
+    print(f"\nStretches without music, at least {args.min_free:.0f}s:")
+    prev = 0.0
+    for a, b in segments + [(total, total)]:
+        if a - prev >= args.min_free:
+            print(f"  {short_ts(prev)} → {short_ts(a)}  ({a - prev:.0f}s)")
+        prev = b
 
 
 def cmd_describe(args: argparse.Namespace) -> None:
@@ -233,10 +296,7 @@ def cmd_transcribe(args: argparse.Namespace) -> None:
     if output.exists() and not args.force:
         raise SystemExit(f"{output} already exists (use --force to overwrite)")
 
-    def progress(done: float, total: float) -> None:
-        pct = 100 * done / total if total else 0
-        print(f"\r  {short_ts(done)} / {short_ts(total)}  ({pct:.0f}%)", end="", file=sys.stderr)
-
+    progress = progress_printer("")
     print(
         f"Transcribing audio track #{args.audio_stream} with {args.model} "
         "(the model is downloaded on first use)…",
@@ -261,8 +321,9 @@ def cmd_transcribe(args: argparse.Namespace) -> None:
 
 
 def _suggest(args: argparse.Namespace, cues: list[Cue]) -> list[Clip]:
+    music_map = None if args.allow_music else get_music_map(args)
     print(f"Asking {args.model} to pick clips from {len(cues)} cues…", file=sys.stderr)
-    return suggest_clips(
+    clips = suggest_clips(
         cues,
         count=args.count,
         min_duration=args.min_duration,
@@ -270,8 +331,18 @@ def _suggest(args: argparse.Namespace, cues: list[Cue]) -> list[Clip]:
         theme=args.theme,
         language=args.language,
         movie=args.movie,
+        music_map=music_map,
+        max_music=args.max_music,
         model=args.model,
     )
+    if music_map is not None and len(clips) < args.count:
+        print(
+            f"Only {len(clips)} clip(s) without original music — try --max-music or a "
+            "shorter --min-duration.",
+            file=sys.stderr,
+        )
+    return clips
+
 
 
 # --- argument parsing ---------------------------------------------------------
@@ -309,6 +380,19 @@ def build_parser() -> argparse.ArgumentParser:
     ai.add_argument("--min-duration", type=float, default=20, help="Seconds (default: 20)")
     ai.add_argument("--max-duration", type=float, default=90, help="Seconds (default: 90)")
     ai.add_argument("--theme", help='What to look for, e.g. "funniest jokes" or "plot twists"')
+    ai.add_argument(
+        "--allow-music", action="store_true",
+        help="Don't avoid moments with music in the original soundtrack",
+    )
+    ai.add_argument(
+        "--max-music", type=float, default=DEFAULT_MAX_MUSIC,
+        help=f"Max share of a clip with original music, 0..1 (default: {DEFAULT_MAX_MUSIC})",
+    )
+
+    audio = argparse.ArgumentParser(add_help=False)
+    audio.add_argument(
+        "--audio-stream", type=int, default=0, help="Audio track to analyse (default: 0)"
+    )
 
     render = argparse.ArgumentParser(add_help=False)
     render.add_argument("-o", "--out", type=Path, default=Path("clips"), help="Output directory")
@@ -329,9 +413,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-meta", action="store_true",
         help="Don't write a YouTube title/description (.txt next to each clip)",
     )
+    render.add_argument(
+        "--music", type=Path,
+        help="Copyright-free background track, or a folder of them (used in turn). "
+        "A <track>.txt with attribution is added to the description",
+    )
+    render.add_argument(
+        "--music-level", type=float, default=video.DEFAULT_MUSIC_LEVEL,
+        help="Music loudness relative to the dialogue in dB, e.g. -6 louder, -14 quieter "
+        f"(default: {video.DEFAULT_MUSIC_LEVEL:g})",
+    )
 
     p = sub.add_parser(
-        "suggest", parents=[common, claude, ai], help="Ask Claude for clips, save a plan"
+        "suggest", parents=[common, claude, ai, audio], help="Ask Claude for clips, save a plan"
     )
     p.add_argument("--plan", type=Path, help="Where to save the plan (default: <video>.plan.json)")
     p.set_defaults(func=cmd_suggest)
@@ -344,7 +438,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_render)
 
     p = sub.add_parser(
-        "run", parents=[common, claude, ai, render], help="Suggest and render in one go"
+        "run", parents=[common, claude, ai, audio, render], help="Suggest and render in one go"
     )
     p.set_defaults(func=cmd_run)
 
@@ -360,6 +454,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--hint", help='What happens on screen, e.g. "бомж избивает бандита"')
     p.set_defaults(func=cmd_cut)
+
+    p = sub.add_parser(
+        "scan-music", parents=[audio],
+        help="Find where the original soundtrack has music (cached in <video>.music.json)",
+    )
+    p.add_argument("video", type=Path, help="Path to the movie file")
+    p.add_argument("--min-free", type=float, default=30, help="Shortest stretch to list, s")
+    p.set_defaults(func=cmd_scan_music)
 
     p = sub.add_parser(
         "describe", parents=[claude],

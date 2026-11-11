@@ -23,10 +23,10 @@ def test_build_request_includes_constraints():
         CUES, count=3, min_duration=15, max_duration=60,
         theme="funny", language="Russian", model="m",
     )
-    assert req["tool_choice"] == {"type": "tool", "name": "submit_clips"}
+    assert req["tools"][0]["name"] == "submit_clips"
     transcript, task = req["messages"][0]["content"]
     assert "[1] 00:00:10 line 1" in transcript["text"]
-    assert "up to 3 clips" in task["text"]
+    assert "Select 3 clips" in task["text"]
     assert "funny" in task["text"] and "Russian" in task["text"]
 
 
@@ -64,6 +64,28 @@ def test_clips_tool_requires_metadata():
     item = req["tools"][0]["input_schema"]["properties"]["clips"]["items"]
     assert {"shorts_title", "description", "hashtags"} <= set(item["required"])
     assert "#shorts" in req["system"]
+
+
+def test_call_tool_asks_again_after_prose_answer():
+    from clipsmith.claude import call_tool
+
+    class ProseFirst:
+        def __init__(self):
+            self.requests = []
+            self.messages = self
+
+        def create(self, **request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return SimpleNamespace(content=[SimpleNamespace(type="text", text="Hmm")],
+                                       stop_reason="end_turn")
+            block = SimpleNamespace(type="tool_use", name="submit_clips", input={"clips": []})
+            return SimpleNamespace(content=[block], stop_reason="tool_use")
+
+    client = ProseFirst()
+    assert call_tool(client, {"model": "m", "messages": []}, "submit_clips") == {"clips": []}
+    assert client.requests[0]["tool_choice"] == {"type": "auto"}
+    assert client.requests[1]["messages"][-1]["role"] == "user"
 
 
 def test_suggest_clips_with_fake_client():

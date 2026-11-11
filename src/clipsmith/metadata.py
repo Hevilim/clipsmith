@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .claude import call_tool, make_client
 from .subtitles import Cue, format_timestamp
 
 TITLE_LIMIT = 100  # hard YouTube limit
@@ -168,7 +169,6 @@ def build_metadata_request(
             + "\nAlways answer by calling the `submit_metadata` tool."
         ),
         "tools": [METADATA_TOOL],
-        "tool_choice": {"type": "tool", "name": "submit_metadata"},
         "messages": [{"role": "user", "content": "\n\n".join(parts)}],
     }
 
@@ -186,17 +186,12 @@ def describe_clip(
     if not clip_cues:
         raise ValueError("The clip has no subtitles — nothing to write a title from.")
     if client is None:
-        import anthropic
-
-        client = anthropic.Anthropic()
+        client = make_client()
     request = build_metadata_request(
         clip_cues, context_cues=context_cues, movie=movie, language=language, hint=hint,
         model=model,
     )
-    response = client.messages.create(**request)
-    for block in response.content:
-        if getattr(block, "type", None) == "tool_use" and block.name == "submit_metadata":
-            meta = meta_from_dict(block.input)
-            if meta:
-                return meta
-    raise RuntimeError("Claude did not return a title and description.")
+    meta = meta_from_dict(call_tool(client, request, "submit_metadata"))
+    if not meta:
+        raise RuntimeError("Claude did not return a title and description.")
+    return meta

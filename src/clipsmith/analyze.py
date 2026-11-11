@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .claude import DEFAULT_MODEL, call_tool, make_client
 from .metadata import META_PROPERTIES, META_REQUIRED, SHORTS_GUIDE, ShortsMeta, meta_from_dict
 from .subtitles import Cue, format_timestamp
 
-DEFAULT_MODEL = os.environ.get("CLIPSMITH_MODEL", "claude-sonnet-4-5")
+MUSIC_MARK = "♪"
+DEFAULT_MAX_MUSIC = 0.15  # share of a clip that may still have original music in it
+
 
 SYSTEM_PROMPT = """\
 You are an experienced film editor who cuts short, shareable clips from movies.
@@ -78,6 +80,7 @@ class Clip:
     end_cue: int
     reason: str = ""
     score: int = 0
+    music: float = 0.0  # share of the clip with music in the original soundtrack
     # YouTube Shorts metadata; kept flat so the plan JSON is easy to edit by hand.
     shorts_title: str = ""
     alt_titles: list[str] = field(default_factory=list)
@@ -107,11 +110,15 @@ class Clip:
         return cls(**{k: v for k, v in data.items() if k in fields})
 
 
-def format_transcript(cues: list[Cue]) -> str:
+def format_transcript(cues: list[Cue], music_map: Any = None) -> str:
+    """Numbered transcript; with a music map, cues over original music get a ♪ mark."""
     lines = []
     for c in cues:
         text = c.text.replace("\n", " / ")
-        lines.append(f"[{c.index}] {format_timestamp(c.start, '.')[:-4]} {text}")
+        mark = ""
+        if music_map is not None and music_map.fraction(c.start, c.end) >= 0.5:
+            mark = f"{MUSIC_MARK} "
+        lines.append(f"[{c.index}] {format_timestamp(c.start, '.')[:-4]} {mark}{text}")
     return "\n".join(lines)
 
 
@@ -125,14 +132,28 @@ def build_request(
     language: str | None,
     model: str,
     movie: str | None = None,
+    music_map: Any = None,
 ) -> dict[str, Any]:
     task = [
-        f"Select up to {count} clips.",
+        f"Select {count} clips (fewer only if there truly aren't enough good moments).",
         f"Each clip must last between {min_duration:.0f} and {max_duration:.0f} seconds "
         "(measured from the start of the first cue to the end of the last cue).",
     ]
     if theme:
         task.append(f"Focus on this theme / request from the user: {theme}")
+    if music_map is not None:
+        task.append(
+            f"Cues marked {MUSIC_MARK} play over music from the original soundtrack. The clips "
+            "get our own copyright-free music instead, so choose moments WITHOUT "
+            f"{MUSIC_MARK} cues; a clip with them will be rejected."
+        )
+        windows = music_free_windows(music_map, min_duration, cues[-1].end)
+        if windows:
+            listed = ", ".join(
+                f"{format_timestamp(a, '.')[:-4]}-{format_timestamp(b, '.')[:-4]}"
+                for a, b in windows
+            )
+            task.append(f"Every clip must fit inside one of these music-free windows: {listed}.")
     task.append(
         f"Movie / series: {movie}." if movie else "The movie name is unknown - do not guess it."
     )
@@ -146,14 +167,15 @@ def build_request(
         "max_tokens": 8192,
         "system": SYSTEM_PROMPT,
         "tools": [CLIPS_TOOL],
-        "tool_choice": {"type": "tool", "name": "submit_clips"},
         "messages": [
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": f"<transcript>\n{format_transcript(cues)}\n</transcript>",
+                        "text": (
+                            f"<transcript>\n{format_transcript(cues, music_map)}\n</transcript>"
+                        ),
                         # The transcript is the bulk of the prompt; cache it so re-runs
                         # with a different theme or count are cheaper.
                         "cache_control": {"type": "ephemeral"},
@@ -202,6 +224,29 @@ def clips_from_response(
     return clips
 
 
+def music_free_windows(
+    music_map: Any, min_duration: float, total: float
+) -> list[tuple[float, float]]:
+    """Stretches without original music that are long enough to hold a clip."""
+    windows, prev = [], 0.0
+    for a, b in music_map.segments() + [(total, total)]:
+        if a - prev >= min_duration:
+            windows.append((prev, a))
+        prev = max(prev, b)
+    return windows
+
+
+def drop_music_clips(
+    clips: list[Clip], music_map: Any, max_music: float = DEFAULT_MAX_MUSIC
+) -> tuple[list[Clip], list[Clip]]:
+    """Split clips into (kept, rejected) by how much original music they contain."""
+    kept, rejected = [], []
+    for clip in clips:
+        clip.music = round(music_map.fraction(clip.start, clip.end), 2)
+        (kept if clip.music <= max_music else rejected).append(clip)
+    return kept, rejected
+
+
 def suggest_clips(
     cues: list[Cue],
     *,
@@ -211,30 +256,31 @@ def suggest_clips(
     theme: str | None = None,
     language: str | None = None,
     movie: str | None = None,
+    music_map: Any = None,
+    max_music: float = DEFAULT_MAX_MUSIC,
     model: str = DEFAULT_MODEL,
     client: Any = None,
 ) -> list[Clip]:
+    """Ask Claude for clips. With `music_map`, clips over original music are dropped."""
     if not cues:
         raise ValueError("Subtitles are empty — nothing to analyze.")
     if client is None:
-        import anthropic
-
-        client = anthropic.Anthropic()
+        client = make_client()
 
     request = build_request(
         cues,
-        count=count,
+        # Ask for spares: some may still be rejected for music.
+        count=count * 2 if music_map is not None else count,
         min_duration=min_duration,
         max_duration=max_duration,
         theme=theme,
         language=language,
         model=model,
         movie=movie,
+        music_map=music_map,
     )
-    response = client.messages.create(**request)
-    for block in response.content:
-        if getattr(block, "type", None) == "tool_use" and block.name == "submit_clips":
-            return clips_from_response(
-                block.input.get("clips", []), cues, max_duration=max_duration
-            )
-    raise RuntimeError("Claude did not return any clips.")
+    result = call_tool(client, request, "submit_clips")
+    clips = clips_from_response(result.get("clips", []), cues, max_duration=max_duration)
+    if music_map is not None:
+        clips, _ = drop_music_clips(clips, music_map, max_music)
+    return clips[:count]

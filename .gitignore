@@ -10,3 +10,4 @@ build/
 # Generated output
 clips/
 *.plan.json
+*.music.json

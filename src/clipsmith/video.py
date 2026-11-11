@@ -53,8 +53,37 @@ _LAYOUT_FILTERS = {
 }
 
 
+# Loudness targets. Film mixes are quiet (often -25 LUFS); Shorts play around -14, so the
+# dialogue is brought up to DIALOGUE_LUFS and a limiter catches the peaks.
+DIALOGUE_LUFS = -16
+# Music level relative to the dialogue before ducking; under speech it drops ~6 dB more.
+DEFAULT_MUSIC_LEVEL = -10.0
+_FMT = "aformat=sample_rates=48000:channel_layouts=stereo"
+# loudnorm resamples to 192 kHz internally, hence the aformat after it.
+_DIALOGUE = f"loudnorm=I={DIALOGUE_LUFS}:TP=-1.5:LRA=11,{_FMT}"
+_LIMITER = "alimiter=limit=0.89:level=disabled"
+
+
 class FFmpegError(RuntimeError):
     pass
+
+
+def music_filter(duration: float, level_db: float = DEFAULT_MUSIC_LEVEL) -> str:
+    """Audio graph mixing a background track (input 1) under the original sound (input 0).
+
+    Both are loudness-normalised first, so the result doesn't depend on how the track was
+    mastered. The track fades in/out and is ducked by the dialogue (sidechain), so lines
+    stay intelligible and the music swells in the pauses.
+    """
+    fade_out = max(0.0, duration - 2.0)
+    music_lufs = DIALOGUE_LUFS + level_db
+    return (
+        f"[1:a]loudnorm=I={music_lufs:.1f}:TP=-3,{_FMT},afade=t=in:d=1,"
+        f"afade=t=out:st={fade_out:.3f}:d=2[mus];"
+        f"[0:a]{_DIALOGUE},asplit=2[orig][key];"
+        "[mus][key]sidechaincompress=threshold=0.05:ratio=4:attack=50:release=600[duck];"
+        f"[orig][duck]amix=inputs=2:duration=first:normalize=0,{_LIMITER}[aout]"
+    )
 
 
 def ensure_ffmpeg() -> None:
@@ -122,6 +151,8 @@ def build_command(
     layout: str = DEFAULT_LAYOUT,
     style: str | None = None,
     crf: int = 20,
+    music: Path | None = None,
+    music_level: float = DEFAULT_MUSIC_LEVEL,
 ) -> list[str]:
     """Build the ffmpeg command line.
 
@@ -132,8 +163,12 @@ def build_command(
     # -ss before -i is fast, and accurate because we re-encode. Timestamps restart at 0,
     # which matches the shifted subtitle file.
     cmd += ["-ss", f"{start:.3f}", "-i", str(video.resolve())]
+    if music is not None:
+        # Looped, so short tracks still cover the whole clip; -t below trims it.
+        cmd += ["-stream_loop", "-1", "-i", str(music.resolve())]
     if soft_subs_path is not None:
         cmd += ["-i", str(soft_subs_path)]
+    subs_input = 2 if music is not None else 1
 
     if layout not in LAYOUTS:
         raise ValueError(f"Unknown layout: {layout} (expected one of {', '.join(LAYOUTS)})")
@@ -145,12 +180,18 @@ def build_command(
         filters.append(_LAYOUT_FILTERS[layout])
     if srt_name:
         filters.append(f"subtitles={srt_name}:force_style='{style}'")
-    if filters:
-        cmd += ["-vf", ",".join(filters)]
 
-    cmd += ["-t", f"{duration:.3f}", "-map", "0:v:0", "-map", "0:a:0?"]
+    if music is not None:
+        video_graph = f"[0:v]{','.join(filters) or 'null'}[vout]"
+        cmd += ["-filter_complex", f"{video_graph};{music_filter(duration, music_level)}"]
+        cmd += ["-t", f"{duration:.3f}", "-map", "[vout]", "-map", "[aout]"]
+    else:
+        if filters:
+            cmd += ["-vf", ",".join(filters)]
+        cmd += ["-af", f"{_DIALOGUE},{_LIMITER}"]
+        cmd += ["-t", f"{duration:.3f}", "-map", "0:v:0", "-map", "0:a:0?"]
     if soft_subs_path is not None:
-        cmd += ["-map", "1:s:0", "-c:s", "mov_text"]
+        cmd += ["-map", f"{subs_input}:s:0", "-c:s", "mov_text"]
     cmd += [
         "-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "160k",
@@ -172,11 +213,14 @@ def render_clip(
     layout: str = DEFAULT_LAYOUT,
     style: str | None = None,
     video_duration: float | None = None,
+    music: Path | None = None,
+    music_level: float = DEFAULT_MUSIC_LEVEL,
 ) -> Path:
     """Render one clip.
 
     `subs` is "burn" (hard subtitles), "soft" (selectable track) or "none".
     `layout` is "blur" / "fit" / "crop" (vertical 1080x1920 for Shorts) or "original".
+    `music` is an optional background track mixed under the original sound.
     """
     if subs not in ("burn", "soft", "none"):
         raise ValueError(f"Unknown subtitle mode: {subs}")
@@ -206,6 +250,8 @@ def render_clip(
             soft_subs_path=srt_path if subs == "soft" else None,
             layout=layout,
             style=style,
+            music=music,
+            music_level=music_level,
         )
         result = subprocess.run(cmd, cwd=tmp_dir, capture_output=True, text=True)
         if result.returncode != 0:

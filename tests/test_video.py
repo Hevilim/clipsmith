@@ -50,6 +50,30 @@ def test_build_command_blur_panel_is_default():
     assert video.PANEL_TOP + 1440 + video.PANEL_BOTTOM == 1920
 
 
+def test_build_command_with_music():
+    cmd = video.build_command(
+        Path("movie.mkv"), Path("out.mp4"), start=0, duration=30, srt_name="clip.srt",
+        music=Path("/music/track.mp3"), music_level=-8,
+    )
+    assert "-vf" not in cmd
+    assert cmd[cmd.index("-stream_loop") + 3] == "/music/track.mp3"
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert graph.startswith("[0:v]") and "subtitles=clip.srt" in graph
+    assert "sidechaincompress" in graph and "loudnorm=I=-24.0" in graph
+    assert graph.rstrip().endswith("[aout]") and "alimiter" in graph
+    assert "afade=t=out:st=28.000" in graph
+    assert [cmd[i + 1] for i, a in enumerate(cmd) if a == "-map"] == ["[vout]", "[aout]"]
+
+
+def test_build_command_music_with_soft_subs_maps_third_input():
+    cmd = video.build_command(
+        Path("m.mkv"), Path("o.mp4"), start=0, duration=5, srt_name=None,
+        soft_subs_path=Path("/tmp/x.srt"), music=Path("t.mp3"), layout="original",
+    )
+    assert "2:s:0" in cmd
+    assert "[0:v]null[vout]" in cmd[cmd.index("-filter_complex") + 1]
+
+
 def test_build_command_rejects_unknown_layout():
     with pytest.raises(ValueError):
         video.build_command(
@@ -65,6 +89,7 @@ def test_build_command_soft_subs():
     )
     assert "-vf" not in cmd
     assert "mov_text" in cmd and "1:s:0" in cmd
+    assert "loudnorm" in cmd[cmd.index("-af") + 1]
 
 
 @pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
@@ -102,3 +127,25 @@ def test_render_clip_end_to_end(tmp_path, mode, layout):
         assert size == "1080,1920"
     assert 3.0 <= video.probe_duration(out) <= 4.3
     assert "Hello" in out.with_suffix(".srt").read_text()
+
+
+@pytest.mark.skipif(not HAS_FFMPEG, reason="ffmpeg not installed")
+def test_render_clip_with_looped_music(tmp_path):
+    src, track = tmp_path / "movie.mp4", tmp_path / "track.mp3"
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=6",
+         "-f", "lavfi", "-i", "sine=frequency=300:duration=6",
+         "-c:v", "libx264", "-c:a", "aac", "-shortest", str(src)],
+        check=True,
+    )
+    # Shorter than the clip, so it has to loop.
+    subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi",
+         "-i", "sine=frequency=800:duration=1.5", str(track)],
+        check=True,
+    )
+    out = tmp_path / "clip.mp4"
+    video.render_clip(src, [Cue(1, 1.0, 3.0, "Hi")], out, start=0.5, end=5.0, padding=0,
+                      music=track)
+    assert 4.3 <= video.probe_duration(out) <= 4.7
